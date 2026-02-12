@@ -72,7 +72,7 @@ async def startup_event():
     
     settings = get_settings()
     logger.info(f"📁 Upload directory: {settings.upload_dir}")
-    logger.info(f"🗄️ ChromaDB directory: {settings.chroma_persist_dir}")
+    logger.info(f"🗄️ Supabase URL: {settings.supabase_url[:30]}..." if settings.supabase_url else "⚠️ Supabase URL: NOT SET")
     logger.info(f"🤖 LLM Model: {settings.llm_model}")
     logger.info(f"📊 Embedding Model: {settings.embedding_model}")
     
