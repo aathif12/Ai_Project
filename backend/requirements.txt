@@ -1,0 +1,28 @@
+# FastAPI and server
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# Document processing
+PyMuPDF
+python-docx==1.1.0
+
+# AI/ML - Embeddings and LLM
+openai>=1.12.0
+tiktoken>=0.6.0
+
+# Supabase (Vector DB + Auth + Storage)
+supabase>=2.3.0
+vecs>=0.4.0
+
+# Data handling
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# Utilities
+uuid6>=2024.1.12
+aiofiles>=23.2.1
+
+# CORS
+starlette>=0.36.0
