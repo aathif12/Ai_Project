@@ -1,13 +1,14 @@
 """
 Supabase Vector Store Service.
-Handles storage and retrieval of document embeddings using Supabase with pgvector.
+Uses Supabase REST API + SQL functions for vector operations.
+No direct database connection needed - works purely through the Supabase client.
 """
 
-import vecs
 from supabase import create_client, Client
 from typing import List, Dict, Any, Optional
 import logging
 import json
+import uuid
 from datetime import datetime
 
 from app.config import get_settings, ensure_directories
@@ -17,59 +18,32 @@ logger = logging.getLogger(__name__)
 
 class VectorStoreService:
     """
-    Vector store service using Supabase pgvector.
+    Vector store service using Supabase REST API with pgvector.
     
-    Supabase provides:
-    - Cloud-hosted PostgreSQL with pgvector extension
-    - Scalable vector similarity search
-    - Integration with Supabase Auth and Storage
+    Uses Supabase's RPC (Remote Procedure Calls) for vector operations,
+    avoiding direct database connections and pooler issues.
     """
     
-    COLLECTION_NAME = "university_documents"
+    TABLE_NAME = "documents"
     
     def __init__(self):
-        """Initialize Supabase client and vector collection."""
+        """Initialize Supabase client."""
         settings = get_settings()
         ensure_directories()
         
-        # Validate required settings
         if not settings.supabase_url or not settings.supabase_key:
             raise ValueError(
                 "Supabase credentials not configured. "
                 "Set SUPABASE_URL and SUPABASE_KEY environment variables."
             )
         
-        if not settings.supabase_db_url:
-            raise ValueError(
-                "Supabase database URL not configured. "
-                "Set SUPABASE_DB_URL environment variable."
-            )
-        
-        # Initialize Supabase client (for table operations)
         self.supabase: Client = create_client(
             settings.supabase_url,
             settings.supabase_key
         )
+        self.dimensions = settings.embedding_dimensions
         
-        # Initialize vecs client for vector operations
-        self.vx = vecs.create_client(settings.supabase_db_url)
-        
-        # Get or create the vector collection
-        self.collection = self.vx.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            dimension=settings.embedding_dimensions
-        )
-        
-        # Create index for faster similarity search
-        try:
-            self.collection.create_index()
-        except Exception:
-            # Index might already exist
-            pass
-        
-        logger.info(
-            f"Vector store initialized. Collection '{self.COLLECTION_NAME}' ready."
-        )
+        logger.info("Vector store initialized with Supabase REST API.")
     
     def add_documents(
         self,
@@ -80,27 +54,23 @@ class VectorStoreService:
     ):
         """
         Add documents with their embeddings to the store.
-        
-        Args:
-            ids: Unique identifiers for each document
-            documents: The text content
-            embeddings: Pre-computed embedding vectors
-            metadatas: Metadata for each document
         """
         try:
-            # Prepare records for vecs
-            # vecs format: (id, embedding, metadata)
             records = []
             for id_, doc, emb, meta in zip(ids, documents, embeddings, metadatas):
-                # Add document text to metadata for retrieval
-                meta_with_text = {
-                    **meta,
-                    "text": doc,
-                }
-                records.append((id_, emb, meta_with_text))
+                records.append({
+                    "id": id_,
+                    "content": doc,
+                    "embedding": emb,
+                    "metadata": meta
+                })
             
-            # Upsert records
-            self.collection.upsert(records=records)
+            # Batch insert using Supabase client
+            # Insert in batches of 50 to avoid payload limits
+            batch_size = 50
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
+                self.supabase.table(self.TABLE_NAME).upsert(batch).execute()
             
             logger.info(f"Added {len(ids)} documents to vector store")
             
@@ -116,33 +86,20 @@ class VectorStoreService:
         document_filter: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Search for similar documents using embedding.
-        
-        Args:
-            query_embedding: The query embedding vector
-            n_results: Number of results to return
-            category_filter: Optional list of categories to filter by
-            document_filter: Optional list of document IDs to filter by
-            
-        Returns:
-            Dictionary with ids, documents, metadatas, and distances
+        Search for similar documents using embedding via RPC function.
         """
         try:
-            # Build filters for vecs
-            filters = {}
-            if category_filter:
-                filters["category"] = {"$in": category_filter}
-            if document_filter:
-                filters["document_id"] = {"$in": document_filter}
+            # Call the match_documents RPC function
+            params = {
+                "query_embedding": query_embedding,
+                "match_count": n_results,
+            }
             
-            # Query the collection
-            results = self.collection.query(
-                data=query_embedding,
-                limit=n_results,
-                filters=filters if filters else None,
-                include_value=True,  # Include distance
-                include_metadata=True
-            )
+            # Add optional filters
+            if category_filter:
+                params["filter_category"] = category_filter[0] if len(category_filter) == 1 else None
+            
+            result = self.supabase.rpc("match_documents", params).execute()
             
             # Format results
             ids = []
@@ -150,16 +107,18 @@ class VectorStoreService:
             metadatas = []
             distances = []
             
-            for result in results:
-                ids.append(result[0])  # id
+            for row in result.data:
+                ids.append(row.get("id", ""))
+                documents.append(row.get("content", ""))
                 
-                # Metadata contains the text
-                meta = result[2] if len(result) > 2 else {}
-                text = meta.pop("text", "")
-                
-                documents.append(text)
+                meta = row.get("metadata", {})
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
                 metadatas.append(meta)
-                distances.append(result[1] if len(result) > 1 else 0)  # distance
+                
+                # similarity is returned (higher = more similar)
+                similarity = row.get("similarity", 0)
+                distances.append(1.0 - similarity)  # Convert to distance
             
             return {
                 "ids": ids,
@@ -173,18 +132,12 @@ class VectorStoreService:
             raise
     
     def get_document_count(self) -> int:
-        """Get total number of documents in the store."""
+        """Get total number of document chunks in the store."""
         try:
-            # Get all records (limited) just to count
-            # Note: This is not efficient for large collections
-            # In production, you might want to query the database directly
-            results = self.collection.query(
-                data=[0.0] * get_settings().embedding_dimensions,  # dummy embedding
-                limit=10000,
-                include_value=False,
-                include_metadata=False
-            )
-            return len(results)
+            result = self.supabase.table(self.TABLE_NAME)\
+                .select("id", count="exact")\
+                .execute()
+            return result.count or 0
         except Exception as e:
             logger.error(f"Error getting document count: {e}")
             return 0
@@ -192,21 +145,17 @@ class VectorStoreService:
     def get_unique_documents(self) -> List[Dict[str, Any]]:
         """Get list of unique uploaded documents with metadata."""
         try:
-            # Query with a dummy embedding to get all records
-            settings = get_settings()
-            results = self.collection.query(
-                data=[0.0] * settings.embedding_dimensions,
-                limit=10000,
-                include_value=False,
-                include_metadata=True
-            )
+            result = self.supabase.table(self.TABLE_NAME)\
+                .select("metadata")\
+                .execute()
             
-            # Extract unique documents
             documents = {}
-            for result in results:
-                meta = result[2] if len(result) > 2 else {}
+            for row in result.data:
+                meta = row.get("metadata", {})
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                    
                 doc_id = meta.get("document_id")
-                
                 if doc_id and doc_id not in documents:
                     documents[doc_id] = {
                         "id": doc_id,
@@ -225,41 +174,25 @@ class VectorStoreService:
     def delete_by_document_id(self, document_id: str):
         """Delete all chunks belonging to a document."""
         try:
-            # Get all IDs for this document first
-            settings = get_settings()
-            results = self.collection.query(
-                data=[0.0] * settings.embedding_dimensions,
-                limit=10000,
-                filters={"document_id": {"$eq": document_id}},
-                include_value=False,
-                include_metadata=False
-            )
+            # Use contains filter on metadata JSONB
+            self.supabase.table(self.TABLE_NAME)\
+                .delete()\
+                .filter("metadata->>document_id", "eq", document_id)\
+                .execute()
             
-            # Delete by IDs
-            ids_to_delete = [r[0] for r in results]
-            
-            if ids_to_delete:
-                self.collection.delete(ids=ids_to_delete)
-                logger.info(
-                    f"Deleted {len(ids_to_delete)} chunks for document {document_id}"
-                )
+            logger.info(f"Deleted chunks for document {document_id}")
             
         except Exception as e:
             logger.error(f"Error deleting document {document_id}: {e}")
             raise
     
     def clear_all(self):
-        """Clear all documents from the collection. Use with caution!"""
+        """Clear all documents from the store. Use with caution!"""
         try:
-            # Delete and recreate the collection
-            self.vx.delete_collection(self.COLLECTION_NAME)
-            
-            settings = get_settings()
-            self.collection = self.vx.get_or_create_collection(
-                name=self.COLLECTION_NAME,
-                dimension=settings.embedding_dimensions
-            )
-            self.collection.create_index()
+            self.supabase.table(self.TABLE_NAME)\
+                .delete()\
+                .neq("id", "00000000-0000-0000-0000-000000000000")\
+                .execute()
             
             logger.warning("Cleared all documents from vector store")
             

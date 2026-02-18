@@ -1,48 +1,85 @@
 -- Supabase Database Setup for UniRAG
 -- Run this SQL in your Supabase SQL Editor (Dashboard > SQL Editor)
+-- URL: https://supabase.com/dashboard/project/YOUR_PROJECT_ID/sql
 
--- Enable the pgvector extension (if not already enabled)
+-- =============================================
+-- Step 1: Enable pgvector extension
+-- =============================================
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- The vecs library will automatically create the necessary tables
--- when you first run the application. However, if you want to
--- manually set up the documents metadata table for direct queries,
--- you can use this:
-
--- Create a table for storing document metadata (optional, for admin purposes)
-CREATE TABLE IF NOT EXISTS documents_metadata (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id TEXT UNIQUE NOT NULL,
-    filename TEXT NOT NULL,
-    category TEXT DEFAULT 'other',
-    page_count INTEGER DEFAULT 0,
-    chunk_count INTEGER DEFAULT 0,
-    file_size BIGINT DEFAULT 0,
-    uploaded_by TEXT,
-    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+-- =============================================
+-- Step 2: Create the documents table with vector column
+-- =============================================
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    embedding vector(1536),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Create index for faster lookups
-CREATE INDEX IF NOT EXISTS idx_documents_category ON documents_metadata(category);
-CREATE INDEX IF NOT EXISTS idx_documents_uploaded_at ON documents_metadata(uploaded_at);
+-- Create index for faster vector similarity search
+CREATE INDEX IF NOT EXISTS idx_documents_embedding ON documents
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
 
--- Create a table for chat history (optional)
+-- Create index for metadata queries
+CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents
+    USING gin (metadata);
+
+-- =============================================
+-- Step 3: Create the vector search function
+-- =============================================
+CREATE OR REPLACE FUNCTION match_documents(
+    query_embedding vector(1536),
+    match_count int DEFAULT 5,
+    filter_category text DEFAULT NULL
+)
+RETURNS TABLE (
+    id text,
+    content text,
+    metadata jsonb,
+    similarity float
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        d.id,
+        d.content,
+        d.metadata,
+        1 - (d.embedding <=> query_embedding) AS similarity
+    FROM documents d
+    WHERE
+        CASE
+            WHEN filter_category IS NOT NULL THEN
+                d.metadata->>'category' = filter_category
+            ELSE true
+        END
+    ORDER BY d.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+
+-- =============================================
+-- Step 4: Create chat history table
+-- =============================================
 CREATE TABLE IF NOT EXISTS chat_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     conversation_id TEXT NOT NULL,
-    role TEXT NOT NULL, -- 'user' or 'assistant'
+    role TEXT NOT NULL,
     content TEXT NOT NULL,
     citations JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Create index for conversation lookups
 CREATE INDEX IF NOT EXISTS idx_chat_conversation_id ON chat_history(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_chat_created_at ON chat_history(created_at);
 
--- Create a table for feedback
+-- =============================================
+-- Step 5: Create feedback table
+-- =============================================
 CREATE TABLE IF NOT EXISTS feedback (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     conversation_id TEXT NOT NULL,
@@ -52,61 +89,18 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Row Level Security (RLS) policies
--- Enable RLS on tables
-ALTER TABLE documents_metadata ENABLE ROW LEVEL SECURITY;
+-- =============================================
+-- Step 6: Row Level Security (allow all for dev)
+-- =============================================
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chat_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feedback ENABLE ROW LEVEL SECURITY;
 
--- Create policies for authenticated access
--- For development, allow all operations. In production, customize these.
+-- Allow all operations (for development - restrict in production)
+CREATE POLICY "Allow all for documents" ON documents FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for chat" ON chat_history FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for feedback" ON feedback FOR ALL USING (true) WITH CHECK (true);
 
--- Documents: Allow all operations for authenticated users
-CREATE POLICY "Allow all for documents" ON documents_metadata
-    FOR ALL USING (true);
-
--- Chat history: Allow all operations
-CREATE POLICY "Allow all for chat" ON chat_history
-    FOR ALL USING (true);
-
--- Feedback: Allow all operations
-CREATE POLICY "Allow all for feedback" ON feedback
-    FOR ALL USING (true);
-
--- Grant permissions (for service role)
-GRANT ALL ON documents_metadata TO service_role;
-GRANT ALL ON chat_history TO service_role;
-GRANT ALL ON feedback TO service_role;
-
--- Function to update the updated_at timestamp
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
-
--- Trigger to auto-update updated_at
-CREATE TRIGGER update_documents_metadata_updated_at
-    BEFORE UPDATE ON documents_metadata
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
--- Helpful queries for monitoring:
-
--- Count documents by category
--- SELECT category, COUNT(*) FROM documents_metadata GROUP BY category;
-
--- Get recent uploads
--- SELECT * FROM documents_metadata ORDER BY uploaded_at DESC LIMIT 10;
-
--- Get chat statistics
--- SELECT conversation_id, COUNT(*) as messages FROM chat_history GROUP BY conversation_id;
-
--- Feedback summary
--- SELECT 
---     COUNT(*) as total_feedback,
---     SUM(CASE WHEN is_helpful THEN 1 ELSE 0 END) as positive,
---     SUM(CASE WHEN NOT is_helpful THEN 1 ELSE 0 END) as negative
--- FROM feedback;
+-- =============================================
+-- Done! Your database is ready for UniRAG.
+-- =============================================
